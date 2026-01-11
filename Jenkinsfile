@@ -1,100 +1,87 @@
 pipeline {
   agent any
 
+  options {
+    timestamps()
+    skipDefaultCheckout(true)
+  }
+
   environment {
-    COMPOSE = 'docker compose -f docker-compose.yml -f docker-compose.ci.yml'
+    DOCKERHUB_USER = "allysa20"              // GANTI dengan username Docker Hub kamu
+    IMAGE_NAME     = "kopwan-tubes"
+    CREDS_ID       = "dockerhub-credentials" // samakan dengan ID credentials di Jenkins
+    TAG            = "${BUILD_NUMBER}"
   }
 
   stages {
     stage('Checkout') {
-      steps { checkout scm }
-    }
-
-    stage('Pre-clean (stop old containers)') {
       steps {
-        bat '''
-        echo === Pre-clean ===
-        %COMPOSE% down -v || exit /b 0
-        '''
+        retry(3) {
+          checkout([
+            $class: 'GitSCM',
+            branches: [[name: '*/main']],
+            userRemoteConfigs: [[url: 'https://github.com/leoniki06/KopwanTubes.git']],
+            extensions: [[$class: 'CloneOption', shallow: true, depth: 1, timeout: 30]]
+          ])
+        }
       }
     }
 
-    stage('Docker Build') {
+    stage('Docker Ready') {
       steps {
-        bat '''
-        echo === Docker Build ===
-        %COMPOSE% build
-        '''
+        bat """
+          @echo on
+          docker context use default || echo "already default"
+          docker version
+        """
       }
     }
 
-    stage('Start Containers (DB only)') {
+    stage('Build Image') {
       steps {
-        bat '''
-        echo === Start DB ===
-        %COMPOSE% up -d db
-        %COMPOSE% ps
-        '''
-      }
-    }
-
-    stage('Wait DB Ready') {
-      steps {
-        bat '''
-        echo === Wait DB Ready ===
-
-        for /L %%i in (1,1,20) do (
-          %COMPOSE% exec -T db mysqladmin ping -uroot -proot --silent && (
-            echo MySQL ready
-            exit /b 0
+        bat """
+          @echo on
+          if not exist Dockerfile (
+            echo ERROR: Dockerfile tidak ada di root
+            dir
+            exit /b 1
           )
-          echo Waiting MySQL... %%i
-          ping 127.0.0.1 -n 3 >nul
-        )
 
-        echo ERROR: MySQL not ready after retries
-        %COMPOSE% logs db
-        exit /b 1
-        '''
+          docker build --no-cache -f Dockerfile -t %IMAGE_NAME%:%TAG% -t %IMAGE_NAME%:latest .
+        """
       }
     }
 
-    stage('Laravel Setup') {
+    stage('Push Docker Hub') {
       steps {
-        bat '''
-        echo === Laravel Setup ===
+        withCredentials([usernamePassword(
+          credentialsId: "${CREDS_ID}",
+          usernameVariable: 'DH_USER',
+          passwordVariable: 'DH_TOKEN'
+        )]) {
+          bat """
+            @echo on
+            echo %DH_TOKEN% | docker login -u %DH_USER% --password-stdin
 
-        rem Jalankan artisan via "run --rm" supaya gak butuh app container running
-        %COMPOSE% run --rm app sh -lc "cp -n .env.example .env || true && php artisan key:generate --force"
-        %COMPOSE% run --rm app php artisan migrate --force
-        %COMPOSE% run --rm app php artisan config:clear
-        %COMPOSE% run --rm app php artisan cache:clear
-        '''
-      }
-    }
+            docker tag %IMAGE_NAME%:%TAG% %DOCKERHUB_USER%/%IMAGE_NAME%:%TAG%
+            docker tag %IMAGE_NAME%:latest %DOCKERHUB_USER%/%IMAGE_NAME%:latest
 
-    stage('Smoke Test') {
-      steps {
-        bat '''
-        echo === Smoke Test ===
-        %COMPOSE% run --rm app php artisan route:list
-        '''
+            docker push %DOCKERHUB_USER%/%IMAGE_NAME%:%TAG%
+            docker push %DOCKERHUB_USER%/%IMAGE_NAME%:latest
+
+            docker logout
+          """
+        }
       }
     }
   }
 
   post {
     always {
-      bat '''
-      echo === Final docker ps ===
-      %COMPOSE% ps
-      '''
-    }
-    cleanup {
-      bat '''
-      echo === Cleanup ===
-      %COMPOSE% down -v
-      '''
+      script {
+        try { bat "docker images" } catch (e) { echo "skip: ${e}" }
+        try { cleanWs() } catch (e) { echo "skip: ${e}" }
+      }
     }
   }
 }
